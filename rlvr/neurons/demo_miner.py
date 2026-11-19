@@ -637,6 +637,31 @@ class DemoMinerSettings(BaseSettings):
     miner_require_validator_permit: bool = True
     # Where workspaces are unpacked; empty means the system temporary directory.
     miner_work_dir: str = ""
+    # Which backend writes the answer: "openrouter" (the paid API client, the default) or
+    # "code_agent" (Claude Code run headless on a subscription, through the capture proxy).
+    # The code_agent backend ignores the OpenRouter solver/acceptance/adjudicator/audit settings;
+    # Claude Code does its own iterating.
+    miner_solver: str = Field(default="openrouter", pattern="^(openrouter|code_agent)$")
+    # The model Claude Code uses for repository (and any non-terminal) tasks: an alias like
+    # "opus"/"sonnet" or a full model id.
+    miner_code_agent_model: str = "opus"
+    # The model Claude Code uses for terminal_script_v1 tasks; empty uses miner_code_agent_model.
+    # Terminal tasks are more mechanical, so a faster model (Sonnet) does them well and leaves the
+    # subscription's rate headroom for the harder repository tasks.
+    miner_code_agent_terminal_model: str = "sonnet"
+    miner_code_agent_binary: str = "claude"
+    # The real upstream the capture proxy forwards to; leave as is for the subscription.
+    miner_code_agent_upstream: str = "https://api.anthropic.com"
+    # HOME for the Claude Code child, where its saved subscription login lives; empty inherits the
+    # miner process's HOME.
+    miner_code_agent_home: str = ""
+    miner_code_agent_max_turns: int = Field(default=80, ge=1, le=1000)
+    # A per-solve client-side spend ceiling passed to `claude --max-budget-usd`; 0 disables it.
+    miner_code_agent_budget_usd: float = Field(default=0.0, ge=0.0)
+    # Claude Code edits and runs commands freely in the throwaway workspace copy. This passes
+    # --dangerously-skip-permissions, which Claude Code refuses as root, so run the miner as a
+    # service user. Set false to deny anything that would prompt instead.
+    miner_code_agent_skip_permissions: bool = True
     miner_sandbox: bool = False
     miner_sandbox_concurrency: int = Field(default=2, ge=1, le=16)
     miner_wrap_up_reserve_s: float = Field(default=90.0, ge=0.0, le=900.0)
@@ -877,6 +902,9 @@ class SolveNotes:
 
     spend: SolveSpend = field(default_factory=SolveSpend)
     ended_by: str = ""
+    # The code_agent backend's own reported dollar cost and turn count for the solve.
+    code_agent_cost_usd: float | None = None
+    code_agent_turns: int | None = None
     tools: Counter = field(default_factory=Counter)
     tool_errors: Counter = field(default_factory=Counter)
     command_failures: int = 0
@@ -2235,9 +2263,9 @@ class DemoMiner:
                     challenge_id=request.challenge_id,
                     miner_hotkey=self.hotkey_address,
                     submission_sha256=submission_sha256,
-                    harness_name="hone-demo-miner",
-                    harness_version="3",
-                    model_provider="openrouter",
+                    harness_name="claude-code" if self.settings.miner_solver == "code_agent" else "hone-demo-miner",
+                    harness_version="1" if self.settings.miner_solver == "code_agent" else "3",
+                    model_provider="anthropic" if self.settings.miner_solver == "code_agent" else "openrouter",
                     model_name=model_name,
                     events=events,
                 )
@@ -2305,6 +2333,8 @@ class DemoMiner:
     ) -> tuple[ModelCompletion, list[dict[str, Any]], bytes]:
         if notes is None:
             notes = SolveNotes(spend=SolveSpend() if spend is None else spend)
+        if self.settings.miner_solver == "code_agent":
+            return await self._generate_code_agent(request, reader, deadline, notes)
         identity = request.identity
         terminal = identity.task_type != "repository_patch_v1"
         small_enough = request.workspace.expanded_size_bytes <= SANDBOX_MAX_WORKSPACE_BYTES
@@ -2325,6 +2355,31 @@ class DemoMiner:
                     notes.acceptance = notes.acceptance or "not run: the answer took all the time"
             self._settle_author(author, result[1], notes)
             return result
+
+    async def _generate_code_agent(
+        self,
+        request: MinerTaskRequest,
+        reader: WorkspaceReader,
+        deadline: float,
+        notes: SolveNotes,
+    ) -> tuple[ModelCompletion | None, list[dict[str, Any]], bytes]:
+        """Solve with Claude Code headless; returns (no completion, events, submission)."""
+        from .codeagent.solver import solve_code_agent
+
+        result = await solve_code_agent(
+            settings=self.settings,
+            request=request,
+            workspace_root=reader.root,
+            deadline=deadline,
+            model_name=self.solver_model(request),
+            log=_log,
+        )
+        notes.ended_by = "code_agent"
+        notes.code_agent_cost_usd = result.cost_usd
+        notes.code_agent_turns = result.num_turns
+        if not result.submission:
+            await _log(f"[code-agent] WARNING: empty submission for task {request.task_id[:16]}")
+        return None, result.events, result.submission
 
     def _start_author(
         self, request: MinerTaskRequest, bench: Workbench, deadline: float, notes: SolveNotes, docs: dict[str, str]
@@ -3840,6 +3895,10 @@ class DemoMiner:
 
     def solver_model(self, request: MinerTaskRequest) -> str:
         """The model that writes this task's answer: MINER_TERMINAL_MODEL for terminal scripts, if set."""
+        if self.settings.miner_solver == "code_agent":
+            if request.identity.task_type == "terminal_script_v1" and self.settings.miner_code_agent_terminal_model:
+                return self.settings.miner_code_agent_terminal_model
+            return self.settings.miner_code_agent_model
         if request.identity.task_type == "terminal_script_v1" and self.settings.miner_terminal_model:
             return self.settings.miner_terminal_model
         if (
@@ -3873,7 +3932,7 @@ def build_demo_miner_app(miner: DemoMiner):
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        if miner.credit_watch is None:
+        if miner.credit_watch is None and miner.settings.miner_solver == "openrouter":
             miner.credit_watch = asyncio.create_task(miner.watch_credit())
         yield
         await miner.aclose()
@@ -3984,7 +4043,7 @@ def run_demo_miner(settings: Optional[DemoMinerSettings] = None) -> None:
     """Set up the wallet, advertise the endpoint, and serve HTTP."""
 
     settings = settings or DemoMinerSettings()
-    if not settings.openrouter_api_key:
+    if settings.miner_solver == "openrouter" and not settings.openrouter_api_key:
         raise SystemExit("set OPENROUTER_API_KEY before starting the demo miner")
 
     import bittensor as bt  # type: ignore[import-not-found]
